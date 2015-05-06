@@ -6,16 +6,78 @@ import akka.actor.ReceiveTimeout
 import akka.persistence._
 import scala.concurrent.duration._
 import akka.contrib.pattern.{ShardRegion, ClusterSharding}
+import scalikejdbc._
+
+import scala.util.{Success, Failure, Try}
+
+object MysqlTableInit {
+  implicit val session = AutoSession
+
+  def createJournalTable() = Try {
+    SQL(
+      """
+        |CREATE TABLE IF NOT EXISTS journal (
+        |  persistence_id VARCHAR(255) NOT NULL,
+        |  sequence_number BIGINT NOT NULL,
+        |  marker VARCHAR(255) NOT NULL,
+        |  message TEXT NOT NULL,
+        |  created TIMESTAMP NOT NULL,
+        |  PRIMARY KEY(persistence_id, sequence_number)
+        |)
+      """.stripMargin).update().apply
+  }
+
+  def createSnapshotTable() = Try {
+    SQL(
+      """
+        |CREATE TABLE IF NOT EXISTS snapshot (
+        |  persistence_id VARCHAR(255) NOT NULL,
+        |  sequence_nr BIGINT NOT NULL,
+        |  snapshot TEXT NOT NULL,
+        |  created BIGINT NOT NULL,
+        |  PRIMARY KEY (persistence_id, sequence_nr)
+        |)
+      """.stripMargin).update().apply
+  }
+}
+
+class ExampleKernel extends akka.kernel.Bootable {
+  override def startup(): Unit = {
+    SnapshotExample.main(Array.empty[String])
+  }
+
+  override def shutdown(): Unit = {
+
+  }
+}
 
 object SnapshotExample extends App {
 
-
-  val idExtractor: ShardRegion.IdExtractor = {
-    case cmd: String  => ((cmd.hashCode % 10).toString, cmd)
+  def retry(num: Int, retried: Int = 0)(block: => Try[Unit]): Try[Unit] = block match {
+    case r if r.isSuccess => r
+    case r if r.isFailure && num >= retried =>
+      Thread.sleep(1000)
+      retry(num, retried + 1)(block)
+    case u => Failure(new RuntimeException("Retries exceeded"))
   }
 
-  val shardResolver: ShardRegion.ShardResolver = msg => msg match {
-    case s : String => (s.hashCode % 2).toString
+  val system = ActorSystem("example")
+
+  retry(100) {
+    MysqlTableInit.createJournalTable().flatMap { _ =>
+      MysqlTableInit.createSnapshotTable().map(_ => ())
+    }
+  }.recover { case t: Throwable =>
+    println("Could not initialize the database; exitting...")
+    System.exit(1)
+  }
+
+  val idExtractor: ShardRegion.IdExtractor = {
+    case (cmd: String, id: String) => ((id.hashCode % 10).toString, cmd)
+  }
+
+  val shardResolver: ShardRegion.ShardResolver = {
+    case (_, _) => "0"
   }
 
   val shardName: String = "SnapshotActor"
@@ -39,17 +101,21 @@ object SnapshotExample extends App {
     def receiveCommand: Actor.Receive = {
       case "print"                               => println("current state = " + state)
       case "snap"                                => saveSnapshot(state)
-      case SaveSnapshotSuccess(metadata)         => // ...
-      case SaveSnapshotFailure(metadata, reason) => // ...
+      case SaveSnapshotSuccess(metadata)         => println("SaveSnapshotSuccess: " + metadata)
+      case SaveSnapshotFailure(metadata, reason) => println("SaveSnapshotFailure: " + metadata + " failure: " + reason)
       case s: String =>
-        persist(s) { evt => state = state.updated(evt); println("received: " + s) }
+        persist(s) { evt =>
+          state = state.updated(evt);
+          println("received: " + s + " state is: " + state)
+        }
     }
 
     def receiveRecover: Actor.Receive = {
       case SnapshotOffer(_, s: ExampleState) =>
-        println("offered state = " + s)
+        println("[RECOVER] => offered state = " + s)
         state = s
       case evt: String =>
+        println("[RECOVER] => offered event: " + evt)
         state = state.updated(evt)
     }
 
@@ -60,7 +126,6 @@ object SnapshotExample extends App {
 
   }
 
-  val system = ActorSystem("example")
 
   val region: ActorRef = ClusterSharding(system).start(
     typeName = SnapshotExample.shardName,
@@ -69,16 +134,14 @@ object SnapshotExample extends App {
     shardResolver = SnapshotExample.shardResolver)
 
 
-
-  for(i <- 1 to 10000){
+  for(i <- 1 to 5) {
     println("Send " + i)
-    region ! i.toString()
-    region ! "snap"
-    Thread.sleep(600)
-
-
+    region ! (i.toString, i.toString)
+    region ! ("print", i.toString)
+    region ! ("snap", i.toString)
+    Thread.sleep(1500)      // receive timeout
+    region ! ("print", i.toString)   // should recover
   }
-
 
   Thread.sleep(1000)
   system.shutdown()
